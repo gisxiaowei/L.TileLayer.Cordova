@@ -123,9 +123,9 @@
     },
 
     /*
-         * Toggle between online and offline functionality
-         * essentially this just calls setURL() with either the ._url_online or ._url_offline, and lets L.TileLayer reload the tiles... or try, anyway
-         */
+       * Toggle between online and offline functionality
+       * essentially this just calls setURL() with either the ._url_online or ._url_offline, and lets L.TileLayer reload the tiles... or try, anyway
+       */
 
     goOnline: function() {
       // use this layer in online mode
@@ -137,8 +137,8 @@
     },
 
     /*
-       * Returns current online/offline state.
-       */
+     * Returns current online/offline state.
+     */
 
     isOnline: function() {
       return this._url == this._url_online;
@@ -148,10 +148,10 @@
     },
 
     /*
-         * A set of functions to do the tile downloads, and to provide suporting calculations related thereto
-         * In particular, a user interface for downloading tiles en masse, would call calculateXYZListFromPyramid() to egt a list of tiles,
-         * then make decisions about whether this is a good idea (e.g. too many tiles), then call downloadXYZList() with success/error callbacks
-         */
+       * A set of functions to do the tile downloads, and to provide suporting calculations related thereto
+       * In particular, a user interface for downloading tiles en masse, would call calculateXYZListFromPyramid() to egt a list of tiles,
+       * then make decisions about whether this is a good idea (e.g. too many tiles), then call downloadXYZList() with success/error callbacks
+       */
 
     calculateXYZListFromPyramid: function(lat, lon, zmin, zmax) {
       // given a latitude and longitude, and a range of zoom levels, return the list of XYZ trios comprising that view
@@ -203,6 +203,30 @@
       }
 
       return xyzlist;
+    },
+
+    // add by gisxiaowei, 2018-06-01
+    calculateTilesInfoFromBounds: function(bounds, zmin, zmax) {
+      // Given a bounds (such as that obtained by calling MAP.getBounds()) and a range of zoom levels, returns the list of XYZ trios comprising that view.
+      // The caller may then call downloadXYZList() with progress and error callbacks to do the fetching.
+
+      var total = 0;
+      var list = [];
+
+      for (z = zmin; z <= zmax; z++) {
+        // Figure out the tile for the northwest point of the bounds.
+        t1_x = this.getX(bounds.getNorthWest().lng, z);
+        t1_y = this.getY(bounds.getNorthWest().lat, z);
+
+        // Figure out the tile for the southeast point of the bounds.
+        t2_x = this.getX(bounds.getSouthEast().lng, z);
+        t2_y = this.getY(bounds.getSouthEast().lat, z);
+
+        total += (t2_x - t1_x + 1) * (t2_y - t1_y + 1);
+        list.push({ xmin: t1_x, ymin: t1_y, xmax: t2_x, ymax: t2_y, z: z });
+      }
+
+      return { total: total, list: list };
     },
 
     getX: function(lon, z) {
@@ -392,11 +416,147 @@
       );
     },
 
+    // add by gisxiaowei, 2018-06-01
+    downloadTiles: function(
+      tilesInfo,
+      overwrite,
+      progress_callback,
+      complete_callback,
+      error_callback
+    ) {
+      var myself = this;
+
+      function runThisOneByIndex(
+        tilesInfo,
+        listIndex,
+        x,
+        y,
+        index,
+        cbprog,
+        cbdone,
+        cberr
+      ) {
+        var z = tilesInfo.list[listIndex].z;
+
+        // thanks to closures this function would call downloadAndStoreTile() for this XYZ, then do the callbacks and all...
+        // all we need to do is call it below, depending on the overwrite outcome
+        function doneWithIt() {
+          // the download was skipped and not an error, so call the progress callback; then either move on to the next one, or else call our success callback
+          // if the progress callback returns false (not null, not undefiend... false) then do not proceed to the next tile; this allows cancellation from the caller code
+          if (cbprog) {
+            var keepgoing = cbprog(index, tilesInfo.total);
+            if (keepgoing === false) {
+              return;
+            }
+          }
+
+          var item = tilesInfo.list[listIndex];
+          if (y < item.ymax) {
+            y++;
+            runThisOneByIndex(
+              tilesInfo,
+              listIndex,
+              x,
+              y,
+              index + 1,
+              cbprog,
+              cbdone,
+              cberr
+            );
+          } else {
+            if (x < item.xmax) {
+              y = item.ymin;
+              x++;
+              runThisOneByIndex(
+                tilesInfo,
+                listIndex,
+                x,
+                y,
+                index + 1,
+                cbprog,
+                cbdone,
+                cberr
+              );
+            } else {
+              if (listIndex < tilesInfo.list.length - 1) {
+                listIndex++;
+                x = tilesInfo.list[listIndex].xmin;
+                y = tilesInfo.list[listIndex].ymin;
+                runThisOneByIndex(
+                  tilesInfo,
+                  listIndex,
+                  x,
+                  y,
+                  index + 1,
+                  cbprog,
+                  cbdone,
+                  cberr
+                );
+              } else {
+                if (cbdone) cbdone();
+              }
+            }
+          }
+        }
+        function yesReally() {
+          myself.downloadAndStoreTile(x, y, z, doneWithIt, function(errmsg) {
+            // an error in downloading, so we bail on the whole process and run the error callback
+            if (cberr) cberr(errmsg);
+          });
+        }
+
+        // trick: if 'overwrite' is true we can just go ahead and download
+        // BUT... if overwrite is false, then test that the file doesn't exist first by failing to open it
+        if (overwrite) {
+          if (myself.options.debug)
+            console.log(
+              "Tile " +
+                z +
+                "/" +
+                x +
+                "/" +
+                y +
+                " -- " +
+                "Overwrite=true so proceeding."
+            );
+          yesReally();
+        } else {
+          var filename = [myself.options.name, z, x, y].join("-") + ".png";
+          myself.dirhandle.getFile(
+            filename,
+            { create: false },
+            function() {
+              // opened the file OK, and we didn't ask for overwrite... we're done here, same as if we had downloaded properly
+              if (myself.options.debug)
+                console.log(filename + " exists. Skipping.");
+              doneWithIt();
+            },
+            function() {
+              // failed to open file, guess we are good to download it since we don't have it
+              if (myself.options.debug)
+                console.log(filename + " missing. Fetching.");
+              yesReally();
+            }
+          );
+        }
+      }
+      runThisOneByIndex(
+        tilesInfo,
+        0,
+        tilesInfo.list[0].xmin,
+        tilesInfo.list[0].ymin,
+        1,
+        progress_callback,
+        complete_callback,
+        error_callback
+      );
+    },
+
     /*
-         *
-         * Other maintenance functions, e.g. count up the cache's usage, and empty the cache
-         *
-         */
+       *
+       * Other maintenance functions, e.g. count up the cache's usage, and empty the cache
+       *
+       */
 
     getDiskUsage: function(callback) {
       var myself = this;
